@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -257,6 +258,83 @@ func TestWebSocketServer__Handler__CloseByClient(t *testing.T) {
 		t.Error("not receive close callback")
 	}
 
+	closeCode := callbackServer.Header().Get(CLOSE_CODE_HEADER_NAME)
+	if closeCode != strconv.Itoa(websocket.CloseAbnormalClosure) {
+		t.Error("invalid close code")
+	}
+	closeText := callbackServer.Header().Get(CLOSE_TEXT_HEADER_NAME)
+	if closeText != "unexpected EOF" {
+		t.Errorf("invalid close text: %s", closeText)
+	}
+}
+
+func TestWebSocketServer__Handler__CloseNormalByClient(t *testing.T) {
+	var pool SessionPool
+	callbackServer := new(testSuccessConnectCallbackServer)
+	tcc1 := httptest.NewServer(http.HandlerFunc(callbackServer.SuccessHandler))
+	tcc2 := httptest.NewServer(http.HandlerFunc(callbackServer.CloseHandler))
+
+	c := TestConfig
+	c.Callback.Connect = tcc1.URL
+	c.Callback.Close = tcc2.URL
+
+	server := NewWebSocketServer(c, NewStats(), &pool)
+
+	tc := httptest.NewServer(http.HandlerFunc(server.Handler))
+
+	dialer := websocket.Dialer{}
+	wsURL := strings.Replace(tc.URL, "http://", "ws://", -1)
+	conn, _, err := dialer.Dial(wsURL, http.Header{testRequestSessionHeader: []string{"hogehoge"}})
+	if err != nil {
+		t.Fatal("cannot connect error:", err)
+	}
+
+	conn.ReadMessage() // pull and drop initial message
+	_, err = pool.Get("hogehoge")
+	if err != nil {
+		t.Fatal("cannot get session error:", err)
+	}
+
+	err = conn.WriteMessage(websocket.TextMessage, []byte("barbar"))
+	if err != nil {
+		t.Fatal("cannot write to connection error:", err)
+	}
+
+	err = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bazbaz"), time.Now().Add(1*time.Second))
+	if err != nil {
+		t.Fatal("cannot write control error:", err)
+	}
+
+	err = conn.Close()
+	if err != nil {
+		t.Fatal("cannot close connection error:", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		time.Sleep(10 * time.Millisecond)
+
+		_, err = pool.Get("hogehoge")
+		if err != nil {
+			break
+		}
+	}
+
+	if err != errSessionNotFound {
+		t.Error("not removed session:", err)
+	}
+
+	if !callbackServer.IsClosed() {
+		t.Error("not receive close callback")
+	}
+
+	closeCode := callbackServer.Header().Get(CLOSE_CODE_HEADER_NAME)
+	if closeCode != strconv.Itoa(websocket.CloseNormalClosure) {
+		t.Error("invalid close code")
+	}
+	closeText := callbackServer.Header().Get(CLOSE_TEXT_HEADER_NAME)
+	if closeText != "bazbaz" {
+		t.Errorf("invalid close text: %s", closeText)
+	}
 }
 
 func TestWebSocketSession__IdleTimeout(t *testing.T) {

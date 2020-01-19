@@ -9,7 +9,9 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -20,6 +22,8 @@ import (
 
 const (
 	ENDPOINT_HEADER_NAME               = "X-Kuiperbelt-Endpoint"
+	CLOSE_CODE_HEADER_NAME             = "X-Kuiperbelt-Close-Cose"
+	CLOSE_TEXT_HEADER_NAME             = "X-Kuiperbelt-Close-Text"
 	CALLBACK_CLIENT_MAX_CONNS_PER_HOST = 32
 )
 
@@ -30,6 +34,7 @@ var (
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 	}
+	headerNewlineToSpace = strings.NewReplacer("\n", " ", "\r", " ")
 )
 
 type errCallbackResponseNotOK int
@@ -325,12 +330,13 @@ func (s *WebSocketServer) shouldDisconnectCallbackRequest() bool {
 }
 
 type WebSocketSession struct {
-	ws       *websocket.Conn
-	key      string
-	server   *WebSocketServer
-	send     chan Message
-	closed   uint32 // accessed atomically
-	closedch chan struct{}
+	ws         *websocket.Conn
+	key        string
+	server     *WebSocketServer
+	send       chan Message
+	closed     uint32 // accessed atomically
+	closeError *websocket.CloseError
+	closedch   chan struct{}
 }
 
 // Key returns the session key.
@@ -376,6 +382,12 @@ func (s *WebSocketSession) sendCloseCallback() {
 	}
 
 	req.Header.Add(s.server.Config.SessionHeader, s.Key())
+	if s.closeError != nil {
+		req.Header.Add(CLOSE_CODE_HEADER_NAME, strconv.Itoa(s.closeError.Code))
+		closeText := headerNewlineToSpace.Replace(s.closeError.Text)
+		closeText = textproto.TrimString(closeText)
+		req.Header.Add(CLOSE_TEXT_HEADER_NAME, closeText)
+	}
 	for name, value := range s.server.Config.ProxySetHeader {
 		if value == "" {
 			req.Header.Del(name)
@@ -442,6 +454,9 @@ func (s *WebSocketSession) recvMessages() {
 	for {
 		msgType, r, err := s.ws.NextReader()
 		if err != nil {
+			if e, ok := err.(*websocket.CloseError); ok {
+				s.closeError = e
+			}
 			if websocket.IsUnexpectedCloseError(err,
 				websocket.CloseGoingAway,
 				websocket.CloseNormalClosure,
